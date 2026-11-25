@@ -1,0 +1,198 @@
+name: RDP via Tailscale
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  rdp:
+    runs-on: windows-2022
+    timeout-minutes: 180
+
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Validate settings
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+          RDP_CLIENT_IP: ${{ secrets.RDP_CLIENT_IP }}
+          TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          if ([string]::IsNullOrWhiteSpace($env:TS_AUTHKEY)) {
+            throw 'Missing TAILSCALE_AUTHKEY secret.'
+          }
+
+          $p = $env:RDP_PASSWORD
+          if ($p.Length -lt 20 -or
+              $p -cnotmatch '[A-Z]' -or
+              $p -cnotmatch '[a-z]' -or
+              $p -notmatch '[0-9]' -or
+              $p -notmatch '[^a-zA-Z0-9]') {
+            throw 'RDP_PASSWORD must contain 20+ characters, uppercase, lowercase, numbers and symbols.'
+          }
+
+          $client = $null
+          if (-not [System.Net.IPAddress]::TryParse(
+              $env:RDP_CLIENT_IP, [ref]$client)) {
+            throw 'Invalid RDP_CLIENT_IP.'
+          }
+
+          $bytes = $client.GetAddressBytes()
+          if ($bytes.Length -ne 4 -or
+              $bytes[0] -ne 100 -or
+              $bytes[1] -lt 64 -or
+              $bytes[1] -gt 127) {
+            throw 'Use your device Tailscale IPv4 address.'
+          }
+
+      - name: Install signed official Tailscale package
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $msi = Join-Path $env:RUNNER_TEMP 'tailscale.msi'
+          $url = 'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi'
+
+          Invoke-WebRequest -Uri $url -OutFile $msi
+
+          $signature = Get-AuthenticodeSignature -FilePath $msi
+          if ($signature.Status -ne 'Valid' -or
+              $signature.SignerCertificate.Subject -notmatch 'O=Tailscale Inc\.?(,|$)') {
+            throw 'Tailscale installer signature verification failed.'
+          }
+
+          $process = Start-Process msiexec.exe `
+            -ArgumentList "/i `"$msi`" /qn /norestart" `
+            -Wait -PassThru
+
+          if ($process.ExitCode -notin @(0, 3010)) {
+            throw "Tailscale installation failed: $($process.ExitCode)"
+          }
+
+          Remove-Item -LiteralPath $msi -Force
+
+      - name: Connect to Tailscale
+        env:
+          TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          & $ts up "--auth-key=$env:TS_AUTHKEY" `
+            "--hostname=gh-rdp-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT" `
+            --unattended --accept-routes=false --accept-dns=false `
+            --timeout=60s
+
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Tailscale authentication failed.'
+          }
+
+          $tsIP = (& $ts ip -4 | Select-Object -First 1)
+          if ($LASTEXITCODE -ne 0 -or -not $tsIP) {
+            throw 'No Tailscale IPv4 address assigned.'
+          }
+
+          "TAILSCALE_IP=$($tsIP.Trim())" >> $env:GITHUB_ENV
+
+      - name: Configure restricted RDP access
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+          RDP_CLIENT_IP: ${{ secrets.RDP_CLIENT_IP }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          # Intended for a fresh disposable GitHub-hosted runner.
+          Set-NetFirewallProfile -Profile Domain,Private,Public `
+            -Enabled True -DefaultInboundAction Block
+
+          Get-NetFirewallRule -Name 'RemoteDesktop*' `
+            -ErrorAction SilentlyContinue |
+            Disable-NetFirewallRule
+
+          Get-NetFirewallRule -DisplayName 'RDP-Tailscale' `
+            -ErrorAction SilentlyContinue |
+            Remove-NetFirewallRule
+
+          # Disable other existing inbound allow rules for port 3389.
+          Get-NetFirewallRule -Direction Inbound -Action Allow |
+            Get-NetFirewallPortFilter |
+            Where-Object { $_.LocalPort -contains '3389' } |
+            Get-NetFirewallRule |
+            Disable-NetFirewallRule
+
+          $password = ConvertTo-SecureString `
+            $env:RDP_PASSWORD -AsPlainText -Force
+
+          New-LocalUser -Name 'RDP' -Password $password `
+            -Description 'Temporary remote desktop user' |
+            Out-Null
+
+          # Remote Desktop Users only; no administrator privileges.
+          $group = Get-LocalGroup -SID 'S-1-5-32-555'
+          Add-LocalGroupMember -Group $group -Member 'RDP'
+
+          $adapter = Get-NetIPAddress -AddressFamily IPv4 |
+            Where-Object { $_.IPAddress -eq $env:TAILSCALE_IP } |
+            Select-Object -First 1
+
+          if (-not $adapter) {
+            throw 'Tailscale network interface not found.'
+          }
+
+          New-NetFirewallRule -Name 'Restricted-Tailscale-RDP' `
+            -DisplayName 'Restricted Tailscale RDP' `
+            -Direction Inbound -Action Allow -Protocol TCP `
+            -LocalPort 3389 -LocalAddress $env:TAILSCALE_IP `
+            -RemoteAddress "$($env:RDP_CLIENT_IP)/32" `
+            -InterfaceAlias $adapter.InterfaceAlias `
+            -Profile Any |
+            Out-Null
+
+          $terminal = 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server'
+          $listener = "$terminal\WinStations\RDP-Tcp"
+
+          Set-ItemProperty -Path $listener `
+            -Name 'UserAuthentication' -Value 1
+          Set-ItemProperty -Path $listener `
+            -Name 'SecurityLayer' -Value 2
+          Set-ItemProperty -Path $listener `
+            -Name 'MinEncryptionLevel' -Value 3
+          Set-ItemProperty -Path $terminal `
+            -Name 'fDenyTSConnections' -Value 0
+
+          Start-Service -Name TermService
+
+      - name: Display address and wait
+        run: |
+          Write-Host "RDP address: $env:TAILSCALE_IP"
+          Write-Host "Username: .\RDP"
+          Write-Host 'Password: the RDP_PASSWORD secret you configured.'
+          Write-Host 'Connect from your allowed device using Tailscale.'
+          Write-Host 'Cancel the workflow to end the session.'
+
+          $end = (Get-Date).AddMinutes(150)
+          while ((Get-Date) -lt $end) {
+            Start-Sleep -Seconds 30
+          }
+
+      - name: Clean up
+        if: always()
+        run: |
+          $ErrorActionPreference = 'Continue'
+
+          Disable-LocalUser -Name 'RDP' -ErrorAction SilentlyContinue
+          Remove-NetFirewallRule -Name 'Restricted-Tailscale-RDP' `
+            -ErrorAction SilentlyContinue
+
+          Set-ItemProperty `
+            -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' `
+            -Name 'fDenyTSConnections' -Value 1 `
+            -ErrorAction SilentlyContinue
+
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          if (Test-Path $ts) {
+            & $ts logout
+          }
